@@ -1,0 +1,4 @@
+﻿{
+    "OllamaUrl":  "http://localhost:11434",
+    "OllamaModel":  "qwen3:30b"
+}
