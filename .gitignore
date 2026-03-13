@@ -1,2 +1,7 @@
 reboot*diagnosis.*
 config.json
+
+# Output files from tools
+kernel-power-report.html
+sleepstudy-report.html
+next-steps-*.md

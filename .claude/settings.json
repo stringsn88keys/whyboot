@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -File .claude/hooks/Check-PS1Quality.ps1"
+          }
+        ]
+      }
+    ]
+  }
+}

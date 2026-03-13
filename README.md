@@ -60,21 +60,65 @@ The main diagnostic script. Finds the last reboot, gathers event log entries aro
 
 Output is saved to the current directory as both `reboot-YYYYMMDD-HHmmss-diagnosis.txt` and `reboot-YYYYMMDD-HHmmss-diagnosis.md`.
 
-### `Get-RebootReason.ps1`
+### `Analyze-RebootPatterns.ps1`
 
-A broader reboot troubleshooter that scans the last N days of event logs for patterns across multiple categories: unexpected shutdowns, kernel-power events, BSODs, hardware errors, disk health, Windows Update reboots, and more.
+Looks across **multiple** unexpected reboots to find services and service combinations that consistently correlate with crashes. Uses Service Control Manager Event 7036 to reconstruct which services were running at the time of each crash, then compares those crash sessions against clean shutdown sessions as a baseline.
 
 ```powershell
-.\Get-RebootReason.ps1
-.\Get-RebootReason.ps1 -Days 30 -AnalyzePreCrash 15
-.\Get-RebootReason.ps1 -InstallMonitoring
+.\Analyze-RebootPatterns.ps1
+.\Analyze-RebootPatterns.ps1 -Days 90 -PreCrashMinutes 60
+.\Analyze-RebootPatterns.ps1 -NoOllama -MinCrashesForPattern 1
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `-Days` | `7` | Days to look back in event logs |
-| `-AnalyzePreCrash` | `10` | Minutes before each crash to analyze |
-| `-InstallMonitoring` | off | Offer to install monitoring tools (BlueScreenView, HWiNFO64, CrystalDiskInfo, etc.) |
+| `-Days` | `60` | Days to look back for unexpected reboots |
+| `-PreCrashMinutes` | `30` | Minutes before each crash to flag as pre-crash activity |
+| `-MinCrashesForPattern` | `2` | Min crashes a service must appear in to be reported |
+| `-MaxCleanSessions` | `10` | Max clean sessions to use as baseline |
+| `-NoOllama` | off | Skip the AI pattern analysis |
+| `-OllamaModel` / `-OllamaUrl` | from `config.json` | Override ollama settings |
+
+**What it detects:**
+
+- **Always-running services** — present in every crash session (100%). Flagged as unusual if rarely seen in clean sessions.
+- **Usually-running services** — present in 75%+ of crashes. Shown with clean-session comparison.
+- **Crash-specific services** — high crash rate but low clean-session rate; strongest signal of a problematic service.
+- **Always-stopped services** — consistently absent from running state at crash time.
+- **Pre-crash service changes** — service state transitions seen in multiple crash sessions within the last N minutes before each crash.
+- **Always co-running pairs** — service combinations that appear together in every crash.
+- **Crash-only pairs** — service combinations that appear in crashes but never in clean sessions.
+
+Output is saved as `reboot-patterns-YYYYMMDD-HHmmss.txt` and `.md`.
+
+> **Note:** Only services that had at least one state-change event (SCM Event 7036) during a session are tracked. Core kernel components that never emit 7036 events will not appear.
+
+### `Get-KernelPowerReport.ps1`
+
+Queries the last N `Microsoft-Windows-Kernel-Power` events and writes a self-contained HTML report. Includes summary statistics, an event ID breakdown table, and histograms by hour of day, day of week, and calendar week, followed by a full scrollable event listing.
+
+```powershell
+.\Get-KernelPowerReport.ps1
+.\Get-KernelPowerReport.ps1 -Count 250 -OutputPath C:\Temp\power.html
+.\Get-KernelPowerReport.ps1 -NoBrowser
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-Count` | `100` | Maximum number of events to retrieve |
+| `-OutputPath` | `kernel-power-report.html` | Path for the HTML report |
+| `-NoBrowser` | off | Skip opening the report in the default browser after writing |
+
+### `AI-Helper.ps1`
+
+Shared dot-source library used by the other scripts. Provides `Invoke-AIAnalysis`, which tries AI providers in priority order until one succeeds:
+
+1. **Claude Code CLI** (`claude -p`) — uses existing Claude Code auth, no key needed
+2. **Claude API** — requires `ClaudeApiKey` in `config.json` or `ANTHROPIC_API_KEY` env var
+3. **Copilot API** — requires `CopilotToken` in `config.json` or `GITHUB_TOKEN` env var
+4. **Ollama** — local fallback, requires `ollama serve` to be running
+
+Not intended to be run directly; dot-sourced by the diagnostic scripts.
 
 ## Example Diagnosis
 

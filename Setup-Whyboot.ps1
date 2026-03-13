@@ -1,13 +1,12 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Sets up whyboot by detecting hardware, selecting the best ollama model,
-    installing ollama, pulling the model, and writing config.json.
+    Sets up whyboot by configuring AI providers (Claude, Copilot, Ollama) and writing config.json.
 .DESCRIPTION
-    Detects system CPU, RAM, and GPU (including VRAM) to select the largest
-    ollama model that will run well on the current hardware. Installs ollama
-    via winget if not already present, pulls the selected model, and saves
-    the configuration to config.json.
+    Configures AI analysis providers in priority order: Claude API > GitHub Copilot > Ollama.
+    Also detects system hardware to select the best Ollama model as a local fallback,
+    installs Ollama via winget if not already present, pulls the selected model, and saves
+    all configuration to config.json.
 .PARAMETER Force
     Skip confirmation prompts.
 .EXAMPLE
@@ -126,7 +125,7 @@ Write-Host "  Effective memory for models: ${effectiveMemGB} GB" -ForegroundColo
 
 # Model selection table (model name -> approximate memory needed in GB)
 # Sorted from largest to smallest; pick the biggest that fits
-# Qwen3 MoE models (30B-A3B) are preferred where they fit — they activate
+# Qwen3 MoE models (30B-A3B) are preferred where they fit - they activate
 # only a fraction of their parameters so they punch well above their size.
 $modelTiers = @(
     @{ Model = "qwen3:235b";  NeedGB = 150; Desc = "235B MoE (22B active) - flagship, needs extreme hardware" }
@@ -261,18 +260,64 @@ if ($ollamaCmd) {
     Write-Host "    ollama pull $($selectedModel.Model)" -ForegroundColor Gray
 }
 
-# ── 5. Write config.json ──────────────────────────────────────────────────────
+# ── 5. Configure AI providers ─────────────────────────────────────────────────
 
-Write-Host "`n[5] Writing configuration..." -ForegroundColor Yellow
+Write-Host "`n[5] Configuring AI providers (Claude → Copilot → Ollama)..." -ForegroundColor Yellow
+Write-Host "  Analysis priority: Claude API > GitHub Copilot > Ollama (local)" -ForegroundColor Gray
 
-$config = @{
-    OllamaModel = $selectedModel.Model
-    OllamaUrl   = "http://localhost:11434"
-} | ConvertTo-Json
+# Load existing config values if present so we don't clobber them on re-run
+$existingConfig = $null
+if (Test-Path $configPath) {
+    try { $existingConfig = Get-Content $configPath -Raw | ConvertFrom-Json } catch {}
+}
 
-$config | Out-File -FilePath $configPath -Encoding UTF8
+$claudeApiKey  = if ($existingConfig -and $existingConfig.ClaudeApiKey)  { $existingConfig.ClaudeApiKey }  else { "" }
+$claudeModel   = if ($existingConfig -and $existingConfig.ClaudeModel)   { $existingConfig.ClaudeModel }   else { "claude-opus-4-6" }
+$copilotToken  = if ($existingConfig -and $existingConfig.CopilotToken)  { $existingConfig.CopilotToken }  else { "" }
+
+# Check environment variables as defaults
+if (-not $claudeApiKey -and $env:ANTHROPIC_API_KEY) { $claudeApiKey = $env:ANTHROPIC_API_KEY }
+if (-not $copilotToken -and $env:GITHUB_TOKEN)       { $copilotToken = $env:GITHUB_TOKEN }
+
+if (-not $Force) {
+    Write-Host "`n  Claude API key (leave blank to skip, or press Enter to keep existing):" -ForegroundColor Yellow
+    if ($claudeApiKey) { Write-Host "  Current: $($claudeApiKey.Substring(0, [Math]::Min(8, $claudeApiKey.Length)))..." -ForegroundColor Gray }
+    $input = Read-Host "  ANTHROPIC_API_KEY"
+    if ($input) { $claudeApiKey = $input }
+
+    Write-Host "`n  GitHub Copilot token (leave blank to skip, or press Enter to keep existing):" -ForegroundColor Yellow
+    if ($copilotToken) { Write-Host "  Current: $($copilotToken.Substring(0, [Math]::Min(8, $copilotToken.Length)))..." -ForegroundColor Gray }
+    $input = Read-Host "  GITHUB_TOKEN"
+    if ($input) { $copilotToken = $input }
+}
+
+if ($claudeApiKey) {
+    Write-Host "  Claude API: configured" -ForegroundColor Green
+} else {
+    Write-Host "  Claude API: not configured (set ANTHROPIC_API_KEY or add to config.json)" -ForegroundColor Gray
+}
+if ($copilotToken) {
+    Write-Host "  Copilot:    configured" -ForegroundColor Green
+} else {
+    Write-Host "  Copilot:    not configured (set GITHUB_TOKEN or add to config.json)" -ForegroundColor Gray
+}
+Write-Host "  Ollama:     $($selectedModel.Model) at http://localhost:11434 (fallback)" -ForegroundColor Gray
+
+# ── 6. Write config.json ──────────────────────────────────────────────────────
+
+Write-Host "`n[6] Writing configuration..." -ForegroundColor Yellow
+
+$configObj = @{
+    OllamaModel   = $selectedModel.Model
+    OllamaUrl     = "http://localhost:11434"
+    ClaudeApiKey  = $claudeApiKey
+    ClaudeModel   = $claudeModel
+    CopilotToken  = $copilotToken
+}
+
+($configObj | ConvertTo-Json) | Out-File -FilePath $configPath -Encoding UTF8
 Write-Host "  Config saved to: $configPath" -ForegroundColor Green
-Write-Host "  Model: $($selectedModel.Model)" -ForegroundColor Gray
+Write-Host "  Ollama model: $($selectedModel.Model)" -ForegroundColor Gray
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 

@@ -1,11 +1,12 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Diagnoses the last system reboot using event logs, ollama LLM analysis, and web search.
+    Diagnoses the last system reboot using event logs, AI analysis, and web search.
 .DESCRIPTION
     Finds the last reboot timestamp, gathers event log entries within a configurable
-    time window, sends the data to a local ollama instance for AI analysis, performs
-    a DuckDuckGo web search for similar issues, and writes a diagnosis file.
+    time window, sends the data to an AI for analysis (Claude → Copilot → Ollama
+    in priority order), performs a DuckDuckGo web search for similar issues, and
+    writes a diagnosis file.
 .PARAMETER OllamaModel
     The ollama model to use for analysis. Defaults to the value in config.json
     (set by Setup-Whyboot.ps1), or "qwen3:4b" if no config exists.
@@ -41,6 +42,9 @@ if (-not $OllamaModel) {
 if (-not $OllamaUrl) {
     $OllamaUrl = if ($config -and $config.OllamaUrl) { $config.OllamaUrl } else { "http://localhost:11434" }
 }
+
+# Load shared AI helper (Claude → Copilot → Ollama priority)
+. (Join-Path $scriptDir "AI-Helper.ps1")
 
 # ── 1. Find the last reboot timestamp ──────────────────────────────────────────
 
@@ -178,9 +182,9 @@ if ($wheaErrors) {
     }
 }
 
-# ── 3. Query ollama for analysis ───────────────────────────────────────────────
+# ── 3. Query AI for analysis (Claude → Copilot → Ollama) ──────────────────────
 
-Write-Host "`nQuerying ollama ($OllamaModel) for analysis..." -ForegroundColor Yellow
+Write-Host "`nQuerying AI for analysis (Claude → Copilot → Ollama)..." -ForegroundColor Yellow
 
 $systemInfo = @"
 Computer: $($os.CSName)
@@ -208,24 +212,15 @@ Based on these events, please provide:
 4. Recommended actions to prevent future unexpected reboots
 "@
 
-$ollamaAnalysis = ""
-$ollamaSuccess = $false
+$aiResult      = Invoke-AIAnalysis -Prompt $ollamaPrompt -Config $config -OllamaModel $OllamaModel -OllamaUrl $OllamaUrl
+$ollamaAnalysis = $aiResult.Response
+$ollamaSuccess  = $aiResult.Success
+$aiProvider     = $aiResult.Provider
 
-try {
-    $body = @{
-        model  = $OllamaModel
-        prompt = $ollamaPrompt
-        stream = $false
-    } | ConvertTo-Json -Depth 10
-
-    $response = Invoke-RestMethod -Uri "$OllamaUrl/api/generate" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 300
-    $ollamaAnalysis = $response.response
-    $ollamaSuccess = $true
-    Write-Host "Ollama analysis complete." -ForegroundColor Green
-} catch {
-    $ollamaAnalysis = "(Ollama analysis unavailable: $_)"
-    Write-Host "Ollama query failed: $_" -ForegroundColor Red
-    Write-Host "Make sure ollama is running (ollama serve) with model '$OllamaModel' pulled." -ForegroundColor Gray
+if ($aiResult.Success) {
+    Write-Host "Analysis complete via $aiProvider." -ForegroundColor Green
+} else {
+    Write-Host "AI analysis unavailable." -ForegroundColor Red
 }
 
 # ── 4. DuckDuckGo web search ──────────────────────────────────────────────────
@@ -306,12 +301,11 @@ try {
     Write-Host "DuckDuckGo search failed: $_" -ForegroundColor Red
 }
 
-# Feed web results to ollama for synthesis if both succeeded
+# Feed web results to AI for synthesis if both succeeded
 $webSynthesis = ""
 if ($ollamaSuccess -and $webSuccess) {
-    Write-Host "Synthesizing web results with ollama..." -ForegroundColor Yellow
-    try {
-        $synthesisPrompt = @"
+    Write-Host "Synthesizing web results with AI..." -ForegroundColor Yellow
+    $synthesisPrompt = @"
 Based on your earlier analysis of the reboot event logs and these web search results for similar issues, provide a brief synthesis of what the web community says about this type of reboot issue and any additional recommendations.
 
 WEB SEARCH RESULTS:
@@ -321,19 +315,12 @@ Your earlier analysis concluded: $($ollamaAnalysis.Substring(0, [Math]::Min(500,
 
 Provide a concise synthesis (3-5 bullet points) of relevant web findings and how they relate to this specific case.
 "@
-
-        $body = @{
-            model  = $OllamaModel
-            prompt = $synthesisPrompt
-            stream = $false
-        } | ConvertTo-Json -Depth 10
-
-        $synthResponse = Invoke-RestMethod -Uri "$OllamaUrl/api/generate" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 300
-        $webSynthesis = $synthResponse.response
-        Write-Host "Web synthesis complete." -ForegroundColor Green
-    } catch {
-        $webSynthesis = "(Web synthesis unavailable: $_)"
-        Write-Host "Web synthesis failed: $_" -ForegroundColor Red
+    $synthResult  = Invoke-AIAnalysis -Prompt $synthesisPrompt -Config $config -OllamaModel $OllamaModel -OllamaUrl $OllamaUrl
+    $webSynthesis = $synthResult.Response
+    if ($synthResult.Success) {
+        Write-Host "Web synthesis complete via $($synthResult.Provider)." -ForegroundColor Green
+    } else {
+        Write-Host "Web synthesis unavailable." -ForegroundColor Red
     }
 }
 
@@ -368,7 +355,7 @@ ALL EVENTS IN WINDOW ($eventCount events):
 $(if ($eventBlock) { $eventBlock } else { "(No events found in window)" })
 
 ================================================================================
-  OLLAMA ANALYSIS (model: $OllamaModel)
+  AI ANALYSIS (provider: $aiProvider)
 ================================================================================
 
 $ollamaAnalysis
@@ -393,15 +380,15 @@ $webSynthesis
 Reboot Time:    $lastBoot
 Shutdown Type:  $shutdownType
 Events Found:   $eventCount events in the $($WindowSeconds * 2)s window
-Ollama Status:  $(if ($ollamaSuccess) { "Analysis complete" } else { "Unavailable" })
+AI Status:      $(if ($ollamaSuccess) { "Analysis complete ($aiProvider)" } else { "Unavailable" })
 Web Search:     $(if ($webSuccess) { "Results found" } else { "Unavailable" })
 
 $(if ($ollamaSuccess) { @"
 AI DIAGNOSIS:
 $ollamaAnalysis
 "@ } else { @"
-NOTE: Ollama was not available. Start ollama with 'ollama serve' and ensure
-the model '$OllamaModel' is pulled ('ollama pull $OllamaModel') for AI analysis.
+NOTE: AI analysis was unavailable. Configure a Claude API key (ANTHROPIC_API_KEY),
+a GitHub Copilot token (GITHUB_TOKEN), or start Ollama ('ollama serve') for analysis.
 "@ })
 "@
 
@@ -435,7 +422,9 @@ $(if ($keyEventsBlock) { $keyEventsBlock } else { "*(None found)*" })
 $(if ($eventBlock) { $eventBlock.TrimEnd() } else { "(No events found in window)" })
 ``````
 
-## Ollama Analysis (model: $OllamaModel)
+## AI Analysis
+
+*Provider: $aiProvider*
 
 $ollamaAnalysis
 
@@ -455,18 +444,19 @@ $webSynthesis
 | Reboot Time | $lastBoot |
 | Shutdown Type | $shutdownType |
 | Events Found | $eventCount events in the $($WindowSeconds * 2)s window |
-| Ollama Status | $(if ($ollamaSuccess) { "Analysis complete" } else { "Unavailable" }) |
+| AI Status | $(if ($ollamaSuccess) { "Analysis complete ($aiProvider)" } else { "Unavailable" }) |
 | Web Search | $(if ($webSuccess) { "Results found" } else { "Unavailable" }) |
 
 $(if ($ollamaSuccess) { @"
 ### AI Diagnosis
 $ollamaAnalysis
 "@ } else { @"
-> **Note:** Ollama was not available. Start ollama with ``ollama serve`` and ensure
-> the model ``$OllamaModel`` is pulled (``ollama pull $OllamaModel``) for AI analysis.
+> **Note:** AI analysis was unavailable. Configure a Claude API key (`ANTHROPIC_API_KEY`),
+> a GitHub Copilot token (`GITHUB_TOKEN`), or start Ollama (`ollama serve`) for analysis.
 "@ })
 "@
 
 $mdReport | Out-File -FilePath $mdFile -Encoding UTF8
 Write-Host "Markdown version: $mdFile" -ForegroundColor Green
 Write-Host ""
+Write-Host "Analysis performed by: $aiProvider" -ForegroundColor Cyan
