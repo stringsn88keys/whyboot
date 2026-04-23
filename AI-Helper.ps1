@@ -59,13 +59,18 @@ function Invoke-AIAnalysis {
     if ($claudeCmd) {
         Write-Host "  Trying Claude Code CLI..." -ForegroundColor Gray
         $tmpPrompt = [System.IO.Path]::GetTempFileName()
+        $savedClaudeCode      = $env:CLAUDECODE
+        $savedConsoleEncoding = [Console]::OutputEncoding
+        $savedOutputEncoding  = $OutputEncoding
         try {
             $Prompt | Out-File -FilePath $tmpPrompt -Encoding UTF8
             # Clear CLAUDECODE so this works even when called from inside a Claude Code session
-            $savedClaudeCode = $env:CLAUDECODE
             $env:CLAUDECODE = $null
-            $output = Get-Content $tmpPrompt | & $claudeCmd.Source -p --no-session-persistence 2>&1
-            $env:CLAUDECODE = $savedClaudeCode
+            # Set UTF-8 so the CLI's stdout is decoded correctly (default OEM/CP437 garbles
+            # multi-byte characters like em dashes into sequences such as ΓÇö).
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            $OutputEncoding = [System.Text.Encoding]::UTF8
+            $output = Get-Content $tmpPrompt -Encoding UTF8 | & $claudeCmd.Source -p --no-session-persistence 2>&1
             if ($LASTEXITCODE -eq 0 -and $output) {
                 $result.Response = $output -join "`n"
                 $result.Provider = "Claude Code CLI"
@@ -76,7 +81,9 @@ function Invoke-AIAnalysis {
         } catch {
             Write-Host "  Claude Code CLI failed: $_" -ForegroundColor DarkYellow
         } finally {
-            $env:CLAUDECODE = $savedClaudeCode
+            $env:CLAUDECODE      = $savedClaudeCode
+            [Console]::OutputEncoding = $savedConsoleEncoding
+            $OutputEncoding      = $savedOutputEncoding
             Remove-Item $tmpPrompt -ErrorAction SilentlyContinue
         }
     }

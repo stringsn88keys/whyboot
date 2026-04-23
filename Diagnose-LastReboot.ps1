@@ -46,6 +46,29 @@ if (-not $OllamaUrl) {
 # Load shared AI helper (Claude → Copilot → Ollama priority)
 . (Join-Path $scriptDir "AI-Helper.ps1")
 
+# ── Helper: parse the actual crash time out of an Event 6008 message ──────────
+# 6008 fires at the *next* boot; the crash timestamp is embedded in its message.
+function Get-CrashTimeFrom6008 ([object]$Event) {
+    $msg = $Event.Message -replace [char]0x200E,'' -replace [char]0x200F,'' `
+                          -replace [char]0x202A,'' -replace [char]0x202B,'' `
+                          -replace [char]0x202C,'' -replace [char]0x202D,'' `
+                          -replace [char]0x202E,''
+    if ($msg -match 'shutdown at (.+?) on (.+?) was unexpected') {
+        try { return [DateTime]::Parse("$($Matches[2].Trim()) $($Matches[1].Trim())") } catch {}
+    }
+    if ($Event.Properties.Count -ge 2) {
+        try { return [DateTime]::Parse("$($Event.Properties[1].Value) $($Event.Properties[0].Value)") } catch {}
+    }
+    return $Event.TimeCreated.AddMinutes(-5)
+}
+
+# Fetch the most recent Kernel-Power 41 early - used to decide the analysis window below
+$kernelPower41 = Get-WinEvent -FilterHashtable @{
+    LogName      = 'System'
+    ProviderName = 'Microsoft-Windows-Kernel-Power'
+    Id           = 41
+} -MaxEvents 1 2>$null
+
 # ── 1. Find the last reboot timestamp ──────────────────────────────────────────
 
 Write-Host "`n===== DIAGNOSE LAST REBOOT =====" -ForegroundColor Cyan
@@ -98,11 +121,45 @@ if ($dirtyShutdown -and $plannedShutdown) {
 }
 
 # ── 2. Gather events within the time window ────────────────────────────────────
+#
+# Kernel-Power 41 indicates the system was not cleanly shut down - most often the
+# user force-reset an unresponsive PC.  In that case a narrow window around the
+# current boot misses everything that led to the hang, so we instead analyse the
+# full session from the previous boot up to the crash time.
 
-Write-Host "`nGathering events within $WindowSeconds seconds of boot..." -ForegroundColor Yellow
+$usedLastShutdownWindow = $false
+$windowDescription      = ""
 
-$windowStart = $lastBoot.AddSeconds(-$WindowSeconds)
-$windowEnd   = $lastBoot.AddSeconds($WindowSeconds)
+if ($kernelPower41 -and $dirtyShutdown) {
+    $crashTime = Get-CrashTimeFrom6008 $dirtyShutdown
+    $prevBoot  = Get-WinEvent -FilterHashtable @{
+        LogName = 'System'
+        Id      = 6005
+    } -MaxEvents 100 2>$null |
+        Where-Object { $_.TimeCreated -lt $crashTime } |
+        Sort-Object TimeCreated -Descending |
+        Select-Object -First 1
+
+    if ($prevBoot) {
+        $windowStart            = $prevBoot.TimeCreated
+        $windowEnd              = $crashTime
+        $usedLastShutdownWindow = $true
+        $windowDescription      = "full session since last boot ($($prevBoot.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) → crash $($crashTime.ToString('yyyy-MM-dd HH:mm:ss')))"
+        Write-Host "`nKernel-Power 41 detected - likely unresponsive PC hard-reset by user." -ForegroundColor Magenta
+        Write-Host "Analyzing full session since last boot instead of $WindowSeconds`s window..." -ForegroundColor Yellow
+        Write-Host "  Session : $($prevBoot.TimeCreated)  →  crash : $crashTime" -ForegroundColor Gray
+    } else {
+        $windowStart       = $lastBoot.AddSeconds(-$WindowSeconds)
+        $windowEnd         = $lastBoot.AddSeconds($WindowSeconds)
+        $windowDescription = "$($WindowSeconds * 2)s window ($windowStart to $windowEnd)"
+        Write-Host "`nGathering events within $WindowSeconds seconds of boot..." -ForegroundColor Yellow
+    }
+} else {
+    $windowStart       = $lastBoot.AddSeconds(-$WindowSeconds)
+    $windowEnd         = $lastBoot.AddSeconds($WindowSeconds)
+    $windowDescription = "$($WindowSeconds * 2)s window ($windowStart to $windowEnd)"
+    Write-Host "`nGathering events within $WindowSeconds seconds of boot..." -ForegroundColor Yellow
+}
 
 # General events (errors, warnings, critical) from System log
 $systemEvents = Get-WinEvent -FilterHashtable @{
@@ -120,12 +177,8 @@ $appEvents = Get-WinEvent -FilterHashtable @{
     EndTime   = $windowEnd
 } -MaxEvents 50 2>$null
 
-# Specific key events (broader search, not limited to the window level filter)
-$kernelPower41 = Get-WinEvent -FilterHashtable @{
-    LogName      = 'System'
-    ProviderName = 'Microsoft-Windows-Kernel-Power'
-    Id           = 41
-} -MaxEvents 1 2>$null
+# Specific key events for the AI prompt (broader search, not limited to the window)
+# $kernelPower41 was already fetched above for window-type determination.
 
 $event6008 = Get-WinEvent -FilterHashtable @{
     LogName   = 'System'
@@ -151,7 +204,7 @@ if ($appEvents)    { $allEvents += $appEvents }
 $allEvents = $allEvents | Sort-Object TimeCreated
 
 $eventCount = $allEvents.Count
-Write-Host "Found $eventCount events in the $($WindowSeconds * 2)-second window." -ForegroundColor Gray
+Write-Host "Found $eventCount events in the $windowDescription." -ForegroundColor Gray
 
 # Format events into structured text
 $eventBlock = ""
@@ -202,7 +255,7 @@ $systemInfo
 KEY REBOOT-RELATED EVENTS:
 $keyEventsBlock
 
-ALL EVENTS WITHIN $($WindowSeconds)s WINDOW OF BOOT ($windowStart to $windowEnd):
+ALL EVENTS IN WINDOW ($windowDescription):
 $eventBlock
 
 Based on these events, please provide:
@@ -345,7 +398,7 @@ SYSTEM INFORMATION
   Shutdown Type: $shutdownType
 
 ================================================================================
-  RAW EVENT LOG DATA ($($WindowSeconds)s window: $windowStart to $windowEnd)
+  RAW EVENT LOG DATA ($windowDescription)
 ================================================================================
 
 KEY REBOOT-RELATED EVENTS:
@@ -379,7 +432,7 @@ $webSynthesis
 
 Reboot Time:    $lastBoot
 Shutdown Type:  $shutdownType
-Events Found:   $eventCount events in the $($WindowSeconds * 2)s window
+Events Found:   $eventCount events ($windowDescription)
 AI Status:      $(if ($ollamaSuccess) { "Analysis complete ($aiProvider)" } else { "Unavailable" })
 Web Search:     $(if ($webSuccess) { "Results found" } else { "Unavailable" })
 
@@ -412,7 +465,7 @@ $mdReport = @"
 | Shutdown Type | $shutdownType |
 
 ## Raw Event Log Data
-**Window:** $($WindowSeconds)s ($windowStart to $windowEnd)
+**Window:** $windowDescription
 
 ### Key Reboot-Related Events
 $(if ($keyEventsBlock) { $keyEventsBlock } else { "*(None found)*" })
@@ -443,7 +496,7 @@ $webSynthesis
 |-------|-------|
 | Reboot Time | $lastBoot |
 | Shutdown Type | $shutdownType |
-| Events Found | $eventCount events in the $($WindowSeconds * 2)s window |
+| Events Found | $eventCount events ($windowDescription) |
 | AI Status | $(if ($ollamaSuccess) { "Analysis complete ($aiProvider)" } else { "Unavailable" }) |
 | Web Search | $(if ($webSuccess) { "Results found" } else { "Unavailable" }) |
 
